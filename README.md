@@ -9,8 +9,6 @@
 ## 데이터
 - 출처:
   
-  https://www.data.go.kr/data/15094847/fileData.do
-  
   https://energyinfo.seoul.go.kr/energy/energyUsagePattern?menu-id=Z020400
 
   https://data.seoul.go.kr/dataList/OA-15507/S/1/datasetView.do
