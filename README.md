@@ -9,8 +9,13 @@
 ## 데이터
 - 출처:
   https://www.data.go.kr/data/15094847/fileData.do
+
   https://data.seoul.go.kr/dataList/OA-15361/S/1/datasetView.do#AXexec
+  
   https://energyinfo.seoul.go.kr/energy/energyUsagePattern?menu-id=Z020400
+
+  https://data.seoul.go.kr/dataList/OA-15507/S/1/datasetView.do
+
   
 - 기간·행 수·열 수: 800행 · 14열
 - 사용한 열: overall(종합 능력치), age(나이), value_eur(몸값, 유로)
