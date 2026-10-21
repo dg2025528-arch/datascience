@@ -10,8 +10,6 @@
 - 출처:
   
   https://www.data.go.kr/data/15094847/fileData.do
-
-  https://data.seoul.go.kr/dataList/OA-15361/S/1/datasetView.do#AXexec
   
   https://energyinfo.seoul.go.kr/energy/energyUsagePattern?menu-id=Z020400
 
