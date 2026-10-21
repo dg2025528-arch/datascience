@@ -14,7 +14,7 @@
 
   https://data.seoul.go.kr/dataList/OA-15507/S/1/datasetView.do
 
-  https://www.kepco.co.kr/home/customer/library/electricity-statistics/sales-volume/boardView.do "(2025.12 , 2026.8)"
+  https://www.kepco.co.kr/home/customer/library/electricity-statistics/sales-volume/boardView.do (2025.12 , 2026.8)
   
 - 기간·행 수·열 수: 
 - 사용한 열: 
