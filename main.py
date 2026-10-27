@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 
@@ -12,26 +13,47 @@ st.caption("전력 사용 패턴이 비슷한 지역을 묶어 태양광 설치 
 
 
 @st.cache_data
-def load_csv(file):
+def load_file(file):
+    name = file.name.lower()
+    if name.endswith((".xlsx", ".xls")):
+        file.seek(0)
+        return pd.read_excel(file)
     for enc in ("utf-8-sig", "cp949", "euc-kr"):
         try:
             file.seek(0)
             return pd.read_csv(file, encoding=enc)
         except Exception:
             continue
-    raise ValueError("CSV를 읽을 수 없습니다. 인코딩을 확인하세요.")
+    raise ValueError("파일을 읽을 수 없습니다. 형식과 인코딩을 확인하세요.")
 
 
-uploaded = st.sidebar.file_uploader("서울 열린데이터광장 CSV 업로드", type="csv")
+uploaded = st.sidebar.file_uploader(
+    "서울 열린데이터광장 파일 업로드", type=["csv", "xlsx", "xls"]
+)
 k = st.sidebar.slider("군집 수 (k)", 2, 8, 3)
 
 if uploaded is None:
-    st.info("왼쪽에서 CSV 파일을 업로드하세요.")
+    st.info("왼쪽에서 CSV 또는 엑셀 파일을 업로드하세요.")
     st.stop()
 
-df = load_csv(uploaded)
+try:
+    df = load_file(uploaded)
+except Exception as e:
+    st.error(f"파일 읽기 오류: {e}")
+    st.stop()
+
 st.subheader("1. 원본 데이터")
 st.dataframe(df.head(20), use_container_width=True)
+
+# 숫자처럼 보이는 문자열 컬럼(쉼표 포함)을 숫자로 변환
+for col in df.columns:
+    if df[col].dtype == object:
+        converted = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+        if converted.notna().mean() > 0.9:
+            df[col] = converted
 
 num_cols = df.select_dtypes(include=np.number).columns.tolist()
 all_cols = df.columns.tolist()
@@ -47,9 +69,7 @@ if len(feature_cols) < 2:
     st.stop()
 
 # 지역별 평균으로 집계
-data = (
-    df.groupby(region_col)[feature_cols].mean().dropna().reset_index()
-)
+data = df.groupby(region_col)[feature_cols].mean().dropna().reset_index()
 if len(data) <= k:
     st.warning("지역 수가 군집 수보다 많아야 합니다. k를 줄이세요.")
     st.stop()
@@ -62,14 +82,15 @@ st.subheader("2. 군집 결과")
 score = silhouette_score(X, model.labels_)
 st.metric("실루엣 점수 (1에 가까울수록 좋음)", f"{score:.3f}")
 
-# 2차원 시각화 (PCA)
-from sklearn.decomposition import PCA
-
 pca = PCA(n_components=2).fit_transform(X)
 data["PC1"], data["PC2"] = pca[:, 0], pca[:, 1]
 fig = px.scatter(
-    data, x="PC1", y="PC2", color="군집",
-    hover_name=region_col, hover_data=feature_cols,
+    data,
+    x="PC1",
+    y="PC2",
+    color="군집",
+    hover_name=region_col,
+    hover_data=feature_cols,
 )
 st.plotly_chart(fig, use_container_width=True)
 
@@ -88,7 +109,7 @@ for rank, c in enumerate(order, 1):
 
 st.download_button(
     "군집 결과 CSV 다운로드",
-    data.to_csv(index=False).encode("utf-8-sig"),
+    data.drop(columns=["PC1", "PC2"]).to_csv(index=False).encode("utf-8-sig"),
     "cluster_result.csv",
     "text/csv",
 )
