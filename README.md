@@ -17,3 +17,5 @@
 
 - 사용한 열: 연도, 시도, 시군구	업종별, 건수 ,현년 전기사용량 ,전년 전기사용량, 공급전압
 - 개인 단위 정보 없음 확인: 예
+  
+- 앱: https://danggokdatascience.streamlit.app/
