@@ -13,15 +13,15 @@ st.caption("전력 사용 패턴이 비슷한 지역을 묶어 태양광 설치 
 
 
 @st.cache_data
-def load_file(file, header_row):
+def load_file(file):
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls")):
         file.seek(0)
-        return pd.read_excel(file, header=header_row)
+        return pd.read_excel(file, header=None)
     for enc in ("utf-8-sig", "cp949", "euc-kr"):
         try:
             file.seek(0)
-            return pd.read_csv(file, encoding=enc, header=header_row)
+            return pd.read_csv(file, encoding=enc, header=None)
         except Exception:
             continue
     raise ValueError("파일을 읽을 수 없습니다. 형식과 인코딩을 확인하세요.")
@@ -32,7 +32,7 @@ uploaded = st.sidebar.file_uploader(
 )
 k = st.sidebar.slider("군집 수 (k)", 2, 8, 3)
 header_row = st.sidebar.number_input(
-    "컬럼명이 있는 줄 번호 (0=첫 줄)", min_value=0, max_value=20, value=0
+    "컬럼명(n월 등)이 있는 줄 번호 (0=첫 줄)", min_value=0, max_value=20, value=0
 )
 
 if uploaded is None:
@@ -40,15 +40,31 @@ if uploaded is None:
     st.stop()
 
 try:
-    df = load_file(uploaded, int(header_row))
+    raw = load_file(uploaded)
 except Exception as e:
     st.error(f"파일 읽기 오류: {e}")
     st.stop()
 
-df.columns = [str(c).strip() for c in df.columns]
-df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+st.subheader("0. 원본 그대로 (맨 위 10줄)")
+st.dataframe(raw.head(10), use_container_width=True)
 
-st.subheader("1. 원본 데이터")
+header_row = int(header_row)
+if header_row >= len(raw):
+    st.warning("줄 번호가 데이터 길이보다 큽니다. 더 작은 값을 입력하세요.")
+    st.stop()
+
+header_vals = raw.iloc[header_row].tolist()
+cols, seen = [], {}
+for i, v in enumerate(header_vals):
+    name = str(v).strip() if pd.notna(v) else f"열{i + 1}"
+    seen[name] = seen.get(name, 0) + 1
+    cols.append(name if seen[name] == 1 else f"{name}_{seen[name]}")
+
+df = raw.iloc[header_row + 1:].reset_index(drop=True)
+df.columns = cols
+df = df.dropna(axis=1, how="all")
+
+st.subheader("1. 컬럼명 적용 후 데이터")
 st.dataframe(df.head(20), use_container_width=True)
 
 # 숫자처럼 보이는 문자열 컬럼(쉼표 포함)을 숫자로 변환
