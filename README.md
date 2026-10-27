@@ -15,5 +15,5 @@
 
   https://www.kepco.co.kr/home/customer/library/electricity-statistics/sales-volume/boardView.do (2025.12 , 2026.8)
 
-- 사용한 열: 연도, 시도, 시군구	업종별, 건수 ,현년 전기사용량 ,전년 전기사용량
+- 사용한 열: 연도, 시도, 시군구	업종별, 건수 ,현년 전기사용량 ,전년 전기사용량, 공급전압
 - 개인 단위 정보 없음 확인: 예
