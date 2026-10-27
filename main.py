@@ -13,15 +13,15 @@ st.caption("전력 사용 패턴이 비슷한 지역을 묶어 태양광 설치 
 
 
 @st.cache_data
-def load_file(file):
+def load_file(file, header_row):
     name = file.name.lower()
     if name.endswith((".xlsx", ".xls")):
         file.seek(0)
-        return pd.read_excel(file)
+        return pd.read_excel(file, header=header_row)
     for enc in ("utf-8-sig", "cp949", "euc-kr"):
         try:
             file.seek(0)
-            return pd.read_csv(file, encoding=enc)
+            return pd.read_csv(file, encoding=enc, header=header_row)
         except Exception:
             continue
     raise ValueError("파일을 읽을 수 없습니다. 형식과 인코딩을 확인하세요.")
@@ -31,16 +31,22 @@ uploaded = st.sidebar.file_uploader(
     "서울 열린데이터광장 파일 업로드", type=["csv", "xlsx", "xls"]
 )
 k = st.sidebar.slider("군집 수 (k)", 2, 8, 3)
+header_row = st.sidebar.number_input(
+    "컬럼명이 있는 줄 번호 (0=첫 줄)", min_value=0, max_value=20, value=0
+)
 
 if uploaded is None:
     st.info("왼쪽에서 CSV 또는 엑셀 파일을 업로드하세요.")
     st.stop()
 
 try:
-    df = load_file(uploaded)
+    df = load_file(uploaded, int(header_row))
 except Exception as e:
     st.error(f"파일 읽기 오류: {e}")
     st.stop()
+
+df.columns = [str(c).strip() for c in df.columns]
+df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
 
 st.subheader("1. 원본 데이터")
 st.dataframe(df.head(20), use_container_width=True)
@@ -58,10 +64,15 @@ for col in df.columns:
 num_cols = df.select_dtypes(include=np.number).columns.tolist()
 all_cols = df.columns.tolist()
 
+if not all_cols:
+    st.warning("읽어온 컬럼이 없습니다. 컬럼명이 있는 줄 번호를 바꿔 보세요.")
+    st.stop()
+
 st.sidebar.markdown("### 컬럼 선택")
 region_col = st.sidebar.selectbox("지역 컬럼", all_cols)
+feature_options = [c for c in num_cols if c != region_col]
 feature_cols = st.sidebar.multiselect(
-    "군집에 쓸 숫자 컬럼", num_cols, default=num_cols[:3]
+    "군집에 쓸 숫자 컬럼", feature_options, default=feature_options[:3]
 )
 
 if len(feature_cols) < 2:
