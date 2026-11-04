@@ -12,7 +12,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # ------------------------------------------------------------
 # 1. 데이터 읽기 (첫 줄은 제목이라 건너뜀, 숫자의 쉼표 제거)
 # ------------------------------------------------------------
-FILE = 'energyUse_data 25.csv'
+FILE = 'energyUse_data_25.csv'
 df = pd.read_csv(FILE, skiprows=1, thousands=',', encoding='utf-8-sig')
 df = df[df['자치구명'] != '총합'].copy()          # 총합 행 제외
 
