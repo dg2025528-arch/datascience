@@ -447,22 +447,35 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 # 탭 1. 데이터 개요 + 처리 로그
 # =========================================================
 with tab1:
-    st.subheader("데이터 개요")
+    st.subheader("원본 데이터")
 
+    # 전력 사용량: 제목 행 적용 전의 진짜 원본
+    power_raw = read_raw(path.read_bytes(), path.suffix.lower())
+
+    st.markdown(f"#### 전력 사용량 원본 ({path.name})")
+    st.write(f"**행 {power_raw.shape[0]}개 × 열 {power_raw.shape[1]}개** · "
+             f"빈 값 {int(power_raw.isna().sum().sum())}개")
+    st.dataframe(power_raw.fillna("").astype(str),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown(f"#### 태양광 발전사업 원본 ({SOLAR_FILE.name})")
+    st.write(f"**행 {solar_raw.shape[0]}개 × 열 {solar_raw.shape[1]}개** · "
+             f"빈 값 {int(solar_raw.isna().sum().sum())}개")
+    st.dataframe(solar_raw, use_container_width=True, hide_index=True)
+
+    st.subheader("자료형·빈 값 개수")
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("#### 전력 사용량 (원본 표)")
-        st.write(f"**행 {original.shape[0]}개 × 열 {original.shape[1]}개**")
-        st.caption("원본은 제목 행을 찾기 위해 문자열로 읽었기 때문에 "
-                   "자료형이 object로 나옵니다. 숫자 변환 결과는 아래 표를 보세요.")
+        st.markdown("**전력 사용량 (제목 행 적용 후)**")
+        st.caption("제목 행을 찾으려고 문자열로 읽어서 자료형이 object로 나옵니다.")
         st.dataframe(overview(original), use_container_width=True)
     with c2:
-        st.markdown("#### 태양광 발전사업 (원본 표)")
-        st.write(f"**행 {solar_raw.shape[0]}개 × 열 {solar_raw.shape[1]}개**")
+        st.markdown("**태양광 발전사업**")
         st.dataframe(overview(solar_raw), use_container_width=True)
 
-    st.markdown("#### 분석에 쓰는 구 × 월 표 (숫자 변환 후)")
-    st.write(f"**행 {matrix.shape[0]}개 × 열 {matrix.shape[1]}개**")
+    st.markdown("**분석에 쓰는 구 × 월 표 (숫자 변환 후, MWh)**")
+    st.write(f"행 {matrix.shape[0]}개 × 열 {matrix.shape[1]}개")
+    st.dataframe(matrix, use_container_width=True)
     st.dataframe(overview(matrix), use_container_width=True)
 
     st.subheader("결측치·이상치 처리와 처리 전후 행 수")
@@ -475,63 +488,143 @@ with tab1:
     )
     st.download_button("전처리 로그 다운로드", to_csv_bytes(all_logs),
                        "preprocess_log.csv", "text/csv")
-
-    with st.expander("분석에 사용하는 월별 값(MWh)"):
-        st.dataframe(matrix, use_container_width=True)
-
-
 # =========================================================
 # 탭 2. 수요 현황
 # =========================================================
 with tab2:
-    st.subheader("질문 1. 어느 구가 전기를 많이 쓰는가?")
+    # ---------------- 막대그래프 (원본 복구) ----------------
+    st.subheader("2025년 구별 연간 전력 사용량")
+    st.caption(
+        "분석 질문: 어느 구가 많이 쓰며, 사용량 상·하위 구는 어디인가?"
+    )
+
     fig = px.bar(
-        ranking, x="자치구", y="연간 사용량(MWh)",
-        color="연간 사용량(MWh)", color_continuous_scale="YlOrRd",
-        title="2025년 서울 자치구별 연간 전력 사용량",
+        ranking,
+        x="자치구",
+        y="연간 사용량(MWh)",
+        color="연간 사용량(MWh)",
+        color_continuous_scale="YlOrRd",
     )
+
     fig.update_layout(
-        height=500, xaxis_title="자치구", yaxis_title="연간 전력 사용량 (MWh)",
-        xaxis={"categoryorder": "array",
-               "categoryarray": ranking["자치구"].tolist()},
+        height=560,
+        xaxis={
+            "categoryorder": "array",
+            "categoryarray": ranking["자치구"].tolist(),
+        },
+        yaxis_title="연간 전력 사용량 (MWh)",
     )
+
     st.plotly_chart(fig, use_container_width=True)
 
-    top, bot = ranking.iloc[0], ranking.iloc[-1]
-    top3_share = ranking["연간 사용량(MWh)"].head(3).sum() / annual.sum() * 100
-    finding(
-        f"{top['자치구']}가 가장 많이 쓰고 {bot['자치구']}가 가장 적게 씁니다.",
-        f"{top['자치구']} {top['연간 사용량(MWh)']:,.0f} MWh vs "
-        f"{bot['자치구']} {bot['연간 사용량(MWh)']:,.0f} MWh "
-        f"({top['연간 사용량(MWh)'] / bot['연간 사용량(MWh)']:.2f}배), "
-        f"상위 3개 구가 전체의 {top3_share:.1f}%",
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("#### 🔺 사용량 상위 3개 구")
+        st.dataframe(
+            ranking.head(3),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    with right:
+        st.markdown("#### 🔻 사용량 하위 3개 구")
+        st.dataframe(
+            ranking.tail(3).sort_values("연간 사용량(MWh)"),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+    top = ranking.iloc[0]
+    bottom = ranking.iloc[-1]
+    ratio = top["연간 사용량(MWh)"] / bottom["연간 사용량(MWh)"]
+
+    st.success(
+        f"발견: {top['자치구']}의 연간 사용량은 "
+        f"{top['연간 사용량(MWh)']:,.0f} MWh로, "
+        f"{bottom['자치구']}의 약 {ratio:.2f}배입니다."
+    )
+
+    st.caption(
+        "해석의 한계: 총사용량에는 인구·건물 규모·업종 구성 등의 영향이 "
+        "포함됩니다. 사용량이 많다는 이유만으로 에너지 효율이 낮다고 "
+        "판단할 수 없습니다."
     )
 
     st.divider()
-    st.subheader("질문 2. 특정 달에 사용이 몰리는 구가 있는가?")
-    heat = shares.reindex(ranking["자치구"].tolist())
-    fig = px.imshow(
-        heat, aspect="auto", color_continuous_scale="YlOrRd",
-        labels={"x": "월", "y": "자치구", "color": "연간 대비 비율(%)"},
-        title="자치구별 월별 전력 사용 비중 (연간 사용량 = 100%)",
+
+    # ---------------- 히트맵 (원본 복구) ----------------
+    st.subheader("구별 월별 사용 패턴 비교")
+    st.caption(
+        "분석 질문: 총사용량 규모를 제외해도 특정 월에 집중되는 구가 있는가?"
     )
-    fig.update_layout(height=max(550, len(heat) * 25),
-                      xaxis_title="월", yaxis_title="자치구")
+
+    heat_mode = st.radio(
+        "히트맵 표시 기준",
+        ["연간 대비 월별 비율(%)", "원본 사용량(MWh)"],
+        horizontal=True,
+    )
+
+    if heat_mode.startswith("연간"):
+        heat = shares.copy()
+        color_label = "연간 대비 비율 (%)"
+    else:
+        heat = matrix.copy()
+        color_label = "사용량 (MWh)"
+
+    heat = heat.reindex(ranking["자치구"].tolist())
+
+    fig = px.imshow(
+        heat,
+        aspect="auto",
+        color_continuous_scale="YlOrRd",
+        labels={
+            "x": "월",
+            "y": "자치구",
+            "color": color_label,
+        },
+    )
+    fig.update_layout(height=max(550, len(heat) * 25))
+
     st.plotly_chart(fig, use_container_width=True)
 
-    peak_month = shares.idxmax(axis=1)
-    counts = peak_month.value_counts()
-    summer_share = feat["여름비중_%"].mean()
-    finding(
-        f"{len(matrix)}개 구 중 {counts.iloc[0]}개 구가 {counts.index[0]}에 "
-        f"사용량이 가장 많습니다.",
-        f"7~8월 평균 비중 {summer_share:.1f}% (균등 분배 시 16.7%), "
-        f"최대 월 비중 최고 구: {shares.max(axis=1).idxmax()} "
-        f"{shares.max(axis=1).max():.2f}%",
+    st.caption(
+        "비율 모드는 각 구의 연간 사용량을 100%로 봅니다. "
+        "12개월 사용량이 같다면 한 달의 비중은 약 8.33%입니다."
     )
-    st.caption("날짜 수 차이와 기온 영향은 분리하지 않았습니다.")
 
+    peak_table = pd.DataFrame({
+        "최대 사용 월": shares.idxmax(axis=1),
+        "최대 월 비중(%)": shares.max(axis=1),
+    }).sort_values("최대 월 비중(%)", ascending=False)
 
+    st.markdown("#### 특정 한 달에 상대적으로 집중된 구")
+    st.dataframe(
+        peak_table.head(5).round(2),
+        use_container_width=True,
+    )
+
+    counts = peak_table["최대 사용 월"].value_counts()
+    common_peak = counts.index[0]
+    common_count = int(counts.iloc[0])
+
+    st.success(
+        f"발견: {len(matrix)}개 구 중 {common_count}개 구의 "
+        f"최대 사용 월은 {common_peak}입니다."
+    )
+
+    most_concentrated = peak_table.iloc[0]
+    st.write(
+        f"**최대 월 비중이 가장 높은 구:** {peak_table.index[0]} "
+        f"— {most_concentrated['최대 사용 월']}에 "
+        f"연간 사용량의 {most_concentrated['최대 월 비중(%)']:.2f}% 사용"
+    )
+
+    st.caption(
+        "월별 증가의 원인은 이 그래프만으로 확정할 수 없습니다. "
+        "냉난방 수요 등을 설명하려면 기온·업종 자료로 추가 확인해야 합니다. "
+        "월마다 날짜 수가 다른 영향도 포함됩니다."
+    )
 # =========================================================
 # 탭 3. 공급·자급률
 # =========================================================
@@ -597,33 +690,7 @@ with tab4:
     st.caption(f"두 변수(log10)의 상관계수: {r:.2f} "
                "(수요 큰 구에 설비도 많은 정도를 보여줍니다)")
 
-    # ---- 질문 5: k 선택
-    st.markdown("#### 질문 5. 군집 수는 몇 개가 적당한가?")
-    rows = []
-    for kk in range(2, 7):
-        km = KMeans(n_clusters=kk, random_state=42, n_init=20).fit_predict(Xs)
-        hc = AgglomerativeClustering(n_clusters=kk, linkage="ward").fit_predict(Xs)
-        rows.append({"k": kk,
-                     "KMeans": silhouette_score(Xs, km),
-                     "계층(ward)": silhouette_score(Xs, hc)})
-    score_df = pd.DataFrame(rows)
-    fig = px.line(
-        score_df.melt("k", var_name="방법", value_name="실루엣 점수"),
-        x="k", y="실루엣 점수", color="방법", markers=True,
-        title="군집 수(k)별 실루엣 점수 비교",
-    )
-    fig.update_layout(xaxis_title="군집 수 (k)", yaxis_title="실루엣 점수")
-    st.plotly_chart(fig, use_container_width=True)
-
-    best = score_df.melt("k").sort_values("value", ascending=False).iloc[0]
-    finding(
-        f"실루엣 점수가 가장 높은 조합은 {best['variable']}, k={int(best['k'])}입니다.",
-        f"점수 {best['value']:.3f} (현재 선택 k={k})",
-    )
-
-    labels = KMeans(n_clusters=k, random_state=42, n_init=20).fit_predict(Xs)
-    feat["군집"] = (labels + 1).astype(str)
-
+  
     # ---- 질문 6: 군집 산점도
     st.divider()
     st.markdown("#### 질문 6. 전력 사용량 대비 태양광 설비가 적은 군집은 어디인가?")
