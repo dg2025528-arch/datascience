@@ -18,12 +18,12 @@ from sklearn.preprocessing import StandardScaler
 # 기본 설정
 # =========================================================
 st.set_page_config(
-    page_title="2025 서울 전력·태양광 분석",
+    page_title="2026 서울 전력·태양광 분석",
     page_icon="⚡",
     layout="wide",
 )
 
-st.title("⚡ 2025 서울 25개 구 전력 사용량과 태양광 설비 분석")
+st.title("⚡ 2026 서울 25개 구 전력 사용량과 태양광 설비 분석")
 st.caption("전력 사용량과 설치된 태양광 설비로 구를 묶고, 추가 설치 우선 검토 지역을 살펴봅니다.")
 
 BASE_DIR = Path(__file__).resolve().parent
