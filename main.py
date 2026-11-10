@@ -1,13 +1,23 @@
+
+# 실행: python -m streamlit run main.py
+# 필수 패키지: streamlit pandas numpy plotly scikit-learn
+# Excel 사용 시 추가: openpyxl (.xlsx), xlrd (.xls)
+# CSV/Excel 파일은 main.py 옆 또는 data 폴더에 놓습니다.
+
 from pathlib import Path
 from io import BytesIO
 import re
+import warnings
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.metrics import silhouette_score
+from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
 
@@ -34,7 +44,7 @@ SEOUL_GU = {
 st.title("⚡ 서울 전력 사용량과 태양광 설비 분석")
 st.caption(
     "2025년 전력 수요와 태양광 사업 자료를 비교하고, "
-    "구별 특성을 군집으로 살펴봅니다."
+    "구별 특성을 군집으로 비교하고 추가 설치 검토 후보를 확인합니다."
 )
 
 
@@ -193,6 +203,408 @@ def extract_gu(value):
     return match.group(1) if match else None
 
 
+
+PRIORITY_MODES = [
+    "기존 조건: 수요 높음·설비용량 적음",
+    "수요 대비 설비가 적은 순",
+    "수요 중앙값 초과 구 중 설비비율이 낮은 순",
+]
+
+FEATURE_LABELS = {
+    "연간소비량_MWh": "연간 전력 사용량",
+    "설비용량_kW": "태양광 설비용량",
+    "여름사용비중_pct": "여름(6~8월) 전력 비중",
+    "가정용비중_pct": "가정용부문 전력 비중",
+    "서비스업비중_pct": "순수써비스 업종 전력 비중",
+}
+
+
+def make_sector_features(sector_source, annual, factor):
+    """선택한 전력 파일 안에서만 업종 비중을 계산합니다."""
+    result = pd.DataFrame(index=annual.index)
+    result.index.name = "자치구"
+    notes = []
+    if sector_source is None:
+        return result, notes
+    work = sector_source.copy()
+    work["시군구"] = work["시군구"].map(normalize)
+    work["업종별"] = work["업종별"].map(normalize)
+    for sector, column in [
+        ("가정용부문", "가정용비중_pct"),
+        ("순수써비스", "서비스업비중_pct"),
+    ]:
+        rows = work[work["업종별"].eq(sector) & work["시군구"].isin(annual.index)]
+        if rows.empty:
+            continue
+        if rows["시군구"].duplicated().any():
+            notes.append(f"{sector}: 구별 중복 행이 있어 이 특성을 사용하지 않습니다.")
+            continue
+        values = rows.set_index("시군구")[MONTHS].apply(to_number) * factor
+        invalid = values.isna().any(axis=1) | (values < 0).any(axis=1)
+        totals = values.sum(axis=1, min_count=12).mask(invalid)
+        ratio = totals.reindex(annual.index).div(annual).mul(100)
+        # '-'를 0으로 간주하지 않고, 합계보다 큰 세부값도 확인 전에는 제외한다.
+        valid = ratio.between(0, 100 + 1e-6)
+        result[column] = ratio.where(valid)
+        if not valid.all():
+            notes.append(
+                f"{sector}: 미집계·결측·음수·합계 불일치로 "
+                f"{int((~valid).sum())}개 구의 비중을 계산하지 못했습니다."
+            )
+    return result, notes
+
+
+def combine_demand_solar(annual, solar_agg):
+    """자료에 없는 설비는 NaN으로 보존하고 실제 0과 구분합니다."""
+    demand = annual.rename("연간소비량_MWh").rename_axis("자치구").reset_index()
+    result = demand.merge(solar_agg, on="자치구", how="left", validate="one_to_one")
+    result["자료내등록없음"] = result["설비용량_kW"].isna()
+    result["설비건수"] = result["설비건수"].astype("Int64")
+    result["수요대비설비_kW_GWh"] = (
+        result["설비용량_kW"] / (result["연간소비량_MWh"] / 1000)
+    )
+    return result.sort_values("연간소비량_MWh", ascending=False).reset_index(drop=True)
+
+
+def build_priority(frame, mode, limit=5):
+    """군집/산점도와 독립된 공개 조건으로 추가 조사 후보를 선정합니다."""
+    if mode not in PRIORITY_MODES:
+        raise ValueError("지원하지 않는 추천 기준입니다.")
+    valid = frame.loc[
+        ~frame["자료내등록없음"]
+        & frame["연간소비량_MWh"].gt(0)
+        & frame["설비용량_kW"].ge(0)
+    ].copy()
+    valid = valid.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["연간소비량_MWh", "설비용량_kW", "수요대비설비_kW_GWh"]
+    )
+    demand_median = float(valid["연간소비량_MWh"].median())
+    solar_median = float(valid["설비용량_kW"].median())
+    valid["수요중앙값차이_MWh"] = valid["연간소비량_MWh"] - demand_median
+    valid["용량중앙값차이_kW"] = valid["설비용량_kW"] - solar_median
+    low_capacity = valid["설비용량_kW"].lt(solar_median)
+    zero_median = bool(not valid.empty and solar_median == 0)
+    if zero_median:
+        # 검증된 0이 입력된 경우에 한함. 미등록 구는 이미 제외되어 있다.
+        low_capacity = valid["설비용량_kW"].eq(0)
+    valid["기존조건후보"] = valid["연간소비량_MWh"].gt(demand_median) & low_capacity
+    valid = valid.sort_values(
+        ["수요대비설비_kW_GWh", "연간소비량_MWh", "자치구"],
+        ascending=[True, False, True],
+    ).reset_index(drop=True)
+    valid.insert(0, "비율순서", np.arange(1, len(valid) + 1))
+    valid["선정"] = False
+    if mode == PRIORITY_MODES[0]:
+        valid["선정"] = valid["기존조건후보"]
+        rule = "전력 사용량 > 수요 중앙값, 설비용량 < 용량 중앙값"
+        if zero_median:
+            rule = "전력 사용량 > 수요 중앙값, 확인된 설비용량 = 0"
+    elif mode == PRIORITY_MODES[1]:
+        valid.loc[valid.head(int(limit)).index, "선정"] = True
+        rule = f"수요 대비 설비용량(kW/GWh)이 낮은 순서로 최대 {int(limit)}개 구"
+    else:
+        pool = valid[valid["연간소비량_MWh"].gt(demand_median)]
+        valid.loc[pool.head(int(limit)).index, "선정"] = True
+        rule = (
+            f"수요 중앙값을 초과한 구 중 설비용량/전력수요가 낮은 순서로 "
+            f"최대 {int(limit)}개 구"
+        )
+    valid["선정근거"] = np.where(valid["선정"], rule, "선택한 조건 밖")
+    return valid, {
+        "demand_median": demand_median, "solar_median": solar_median,
+        "n": len(valid), "zero_median": zero_median, "rule": rule,
+    }
+
+
+def prepare_power(raw, unit=None):
+    """원래 전처리를 재사용해 2025년 서울 구별 전력 표를 만듭니다."""
+    power_logs = []
+    sector_source = None
+    header_row = None
+
+    for row in range(min(30, len(raw))):
+        values = {normalize(v) for v in raw.iloc[row]}
+        if "1월" in values and (
+            "자치구명" in values or "시군구" in values
+        ):
+            header_row = row
+            break
+
+    if header_row is None:
+        raise ValueError(
+            "'자치구명' 또는 '시군구', '1월'이 포함된 제목 행이 필요합니다."
+        )
+
+    power_original = make_table(raw, header_row)
+    work = power_original.copy()
+
+    before = len(work)
+    work = work.dropna(how="all")
+    add_log(
+        power_logs, "전력", "완전히 빈 행 제거",
+        before, len(work),
+    )
+
+    is_kepco = {
+        "연도", "시도", "시군구", "업종별"
+    }.issubset(work.columns)
+
+    if is_kepco:
+        region_col = "시군구"
+        default_unit = "kWh"
+
+        before = len(work)
+        work = work[to_number(work["연도"]).eq(2025)].copy()
+        add_log(
+            power_logs, "전력", "2025년 선택",
+            before, len(work),
+        )
+
+        before = len(work)
+        work = work[
+            work["시도"].map(normalize).isin(["서울특별시", "서울"])
+        ].copy()
+        add_log(
+            power_logs, "전력", "서울 선택",
+            before, len(work),
+        )
+
+        sector_source = work.copy()
+
+        before = len(work)
+        work = work[
+            work["업종별"].map(normalize).isin(["합계", "계", "총계"])
+        ].copy()
+        add_log(
+            power_logs, "전력", "업종 합계 행 선택",
+            before, len(work), "세부 업종과 합계의 이중 집계 방지",
+        )
+    else:
+        region_col = "자치구명"
+        default_unit = "MWh"
+
+        if region_col not in work.columns:
+            raise ValueError("자치구명 컬럼이 없습니다.")
+
+        if "연도" in work.columns:
+            before = len(work)
+            work = work[to_number(work["연도"]).eq(2025)].copy()
+            add_log(
+                power_logs, "전력", "2025년 선택",
+                before, len(work),
+            )
+
+    missing_columns = [m for m in MONTHS if m not in work.columns]
+    if missing_columns:
+        raise ValueError(
+            "월별 컬럼이 없습니다: " + ", ".join(missing_columns)
+        )
+
+    power_unit = unit or default_unit
+    if power_unit not in {"kWh", "MWh", "GWh"}:
+        raise ValueError("전력 단위는 kWh, MWh, GWh 중 하나여야 합니다.")
+
+    work[region_col] = work[region_col].map(normalize)
+
+    before = len(work)
+    work = work[work[region_col].isin(SEOUL_GU)].copy()
+    add_log(
+        power_logs, "전력", "서울 25개 구 선택",
+        before, len(work),
+    )
+
+    if work[region_col].duplicated().any():
+        duplicates = work.loc[
+            work[region_col].duplicated(keep=False), region_col
+        ].unique()
+        raise ValueError(
+            "구별 중복 행이 있습니다. 자동 합산하지 않았습니다: "
+            + ", ".join(duplicates)
+        )
+
+    matrix = work.set_index(region_col)[MONTHS].copy()
+    matrix.index.name = "자치구"
+
+    factor = {"kWh": 0.001, "MWh": 1, "GWh": 1000}[power_unit]
+
+    for month in MONTHS:
+        matrix[month] = to_number(matrix[month]) * factor
+
+    invalid_cells = int(matrix.isna().sum().sum())
+    missing_details = [
+        f"{gu}: " + ", ".join(row.index[row.isna()].tolist())
+        for gu, row in matrix.iterrows() if row.isna().any()
+    ]
+    before = len(matrix)
+    matrix = matrix.dropna(how="any")
+    add_log(
+        power_logs, "전력", "월별 결측·숫자 변환 실패 처리",
+        before, len(matrix),
+        f"결측 셀 {invalid_cells}개. 12개월이 완전한 구만 사용. "
+        + "; ".join(missing_details),
+    )
+
+    before = len(matrix)
+    matrix = matrix.loc[~(matrix < 0).any(axis=1)]
+    add_log(
+        power_logs, "전력", "음수가 포함된 구 제외",
+        before, len(matrix), "원본 확인 필요",
+    )
+
+    before = len(matrix)
+    matrix = matrix.loc[matrix.sum(axis=1) > 0].sort_index()
+    add_log(
+        power_logs, "전력", "연간 사용량 0 이하 제외",
+        before, len(matrix),
+    )
+
+    if matrix.empty:
+        raise ValueError("전처리 후 남은 전력 데이터가 없습니다.")
+
+    annual = matrix.sum(axis=1)
+    shares = matrix.div(annual, axis=0) * 100
+
+    lo, hi = iqr_limits(annual)
+    outliers = annual[(annual < lo) | (annual > hi)].index.tolist()
+
+    add_log(
+        power_logs, "전력", "연간 사용량 이상치 점검",
+        len(matrix), len(matrix),
+        "IQR×1.5 기준. 실제 지역 규모 차이일 수 있어 유지. 후보: "
+        + (", ".join(outliers) if outliers else "없음"),
+    )
+
+    sector_features, sector_notes = make_sector_features(sector_source, annual, factor)
+    return {
+        "original": power_original, "matrix": matrix, "annual": annual,
+        "shares": shares, "logs": power_logs, "unit": power_unit,
+        "default_unit": default_unit, "sector_features": sector_features,
+        "sector_notes": sector_notes,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def fit_cluster_models(frame, feature_cols, log_cols, k):
+    """같은 전처리로 세 군집 모델을 비교하고 구별 결과와 진단 표를 반환합니다.
+
+    군집 번호는 평균 전력 수요, 평균 설비용량 순서이며 설치 순위가 아닙니다.
+    GMM의 군집소속확률은 최대 사후확률이며 설치 성공확률이 아닙니다.
+    입력 오류는 즉시 알리고, 개별 모델 실패는 진단 표에 남깁니다.
+    """
+    feature_cols = list(feature_cols)
+    log_cols = set(log_cols)
+    if not feature_cols or len(set(feature_cols)) != len(feature_cols):
+        raise ValueError("서로 다른 군집 입력 특성을 하나 이상 선택하세요.")
+    required = set(feature_cols) | {"연간소비량_MWh", "설비용량_kW"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError("군집 입력 컬럼이 없습니다: " + ", ".join(missing))
+    if not log_cols.issubset(feature_cols):
+        raise ValueError("로그 변환 대상은 군집 입력 특성에 포함되어야 합니다.")
+    if not isinstance(k, (int, np.integer)) or not 2 <= k < len(frame):
+        raise ValueError("군집 수는 2 이상이고 분석 대상 구 수보다 작아야 합니다.")
+
+    base = frame.reset_index(drop=True).copy()
+    inputs = base[feature_cols].to_numpy(dtype=float, copy=True)
+    if not np.isfinite(inputs).all():
+        raise ValueError("군집 입력에 결측값 또는 무한대가 있습니다.")
+    ordering = base[["연간소비량_MWh", "설비용량_kW"]].to_numpy(dtype=float)
+    if not np.isfinite(ordering).all():
+        raise ValueError("군집 번호 정렬에 사용하는 수요·용량이 유효하지 않습니다.")
+    for index, column in enumerate(feature_cols):
+        if column in log_cols:
+            if (inputs[:, index] < 0).any():
+                raise ValueError(f"{column}: 로그 변환 대상에는 음수가 없어야 합니다.")
+            inputs[:, index] = np.log1p(inputs[:, index])
+    constants = [
+        column for index, column in enumerate(feature_cols)
+        if np.all(inputs[:, index] == inputs[0, index])
+    ]
+    if len(np.unique(inputs, axis=0)) < k:
+        raise ValueError("서로 다른 구별 입력값 수보다 군집 수가 많습니다.")
+    scaled = StandardScaler().fit_transform(inputs)
+    if not np.isfinite(scaled).all():
+        raise ValueError("표준화 결과가 유효하지 않습니다. 입력값 범위를 확인하세요.")
+    common_notes = ["상수 특성: " + ", ".join(constants)] if constants else []
+
+    factories = {
+        "KMeans": lambda: KMeans(n_clusters=k, random_state=42, n_init=20),
+        "계층적 군집 (Ward)": lambda: AgglomerativeClustering(
+            n_clusters=k, linkage="ward"
+        ),
+        "GMM": lambda: GaussianMixture(
+            n_components=k, covariance_type="diag", reg_covar=1e-3,
+            n_init=10, max_iter=500, random_state=42,
+        ),
+    }
+    labeled_frames = {}
+    metrics = []
+    for name, factory in factories.items():
+        row = {
+            "모델": name, "실루엣 점수": np.nan, "군집 수": np.nan,
+            "최소 군집 구 수": np.nan, "군집 크기": "", "BIC": np.nan,
+            "상태": "",
+        }
+        caught = []
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                model = factory()
+                labels = model.fit_predict(scaled)
+                actual_labels, counts = np.unique(labels, return_counts=True)
+                row["군집 수"] = len(actual_labels)
+                row["최소 군집 구 수"] = int(counts.min())
+                if len(actual_labels) != k:
+                    raise ValueError(
+                        f"요청한 {k}개 중 {len(actual_labels)}개 군집만 생성되어 제외"
+                    )
+                if name == "GMM" and not model.converged_:
+                    raise ValueError("GMM이 수렴하지 않아 결과에서 제외했습니다.")
+
+                ordered_labels = sorted(
+                    actual_labels,
+                    key=lambda label: (
+                        float(ordering[labels == label, 0].mean()),
+                        float(ordering[labels == label, 1].mean()), int(label),
+                    ),
+                )
+                label_map = {
+                    label: str(index + 1) for index, label in enumerate(ordered_labels)
+                }
+                result = base.drop(columns=["군집소속확률"], errors="ignore").copy()
+                result["군집"] = [label_map[label] for label in labels]
+                if name == "GMM":
+                    probabilities = model.predict_proba(scaled).max(axis=1)
+                    if not np.isfinite(probabilities).all():
+                        raise ValueError("GMM 군집소속확률이 유효하지 않습니다.")
+                    result["군집소속확률"] = probabilities
+                    row["BIC"] = float(model.bic(scaled))
+                if 2 <= len(actual_labels) < len(base):
+                    row["실루엣 점수"] = float(silhouette_score(scaled, labels))
+                sizes = result["군집"].value_counts()
+                row["군집 크기"] = ", ".join(
+                    f"{index}군집 {int(sizes[str(index)])}개"
+                    for index in range(1, k + 1)
+                )
+                labeled_frames[name] = result
+                row["상태"] = "정상"
+        except Exception as exc:
+            row["상태"] = f"분석 제외: {exc}"
+        # 학습 결과와 관련된 경고만 표시하고 실행환경의 코어 감지 안내 등은 제외한다.
+        notes = common_notes + list(dict.fromkeys(
+            str(w.message) for w in caught
+            if issubclass(w.category, (ConvergenceWarning, RuntimeWarning))
+        ))
+        if notes:
+            row["상태"] += " | " + " | ".join(notes)
+        metrics.append(row)
+
+    if not labeled_frames:
+        details = "; ".join(f"{row['모델']}: {row['상태']}" for row in metrics)
+        raise ValueError("모든 군집 모델을 적용하지 못했습니다. " + details)
+    return labeled_frames, pd.DataFrame(metrics)
+
+
 # =========================================================
 # 3. 파일 선택
 # =========================================================
@@ -236,164 +648,43 @@ except Exception as exc:
 # =========================================================
 # 4. 전력 데이터 전처리
 # =========================================================
-power_logs = []
-
 try:
-    header_row = None
-
-    for row in range(min(30, len(power_raw))):
-        values = {normalize(v) for v in power_raw.iloc[row]}
-        if "1월" in values and (
-            "자치구명" in values or "시군구" in values
-        ):
-            header_row = row
-            break
-
-    if header_row is None:
-        raise ValueError(
-            "'자치구명' 또는 '시군구', '1월'이 포함된 제목 행이 필요합니다."
-        )
-
-    power_original = make_table(power_raw, header_row)
-    work = power_original.copy()
-
-    before = len(work)
-    work = work.dropna(how="all")
-    add_log(
-        power_logs, "전력", "완전히 빈 행 제거",
-        before, len(work),
-    )
-
-    is_kepco = {
-        "연도", "시도", "시군구", "업종별"
-    }.issubset(work.columns)
-
-    if is_kepco:
-        region_col = "시군구"
-        default_unit = "kWh"
-
-        before = len(work)
-        work = work[to_number(work["연도"]).eq(2025)].copy()
-        add_log(
-            power_logs, "전력", "2025년 선택",
-            before, len(work),
-        )
-
-        before = len(work)
-        work = work[
-            work["시도"].map(normalize).isin(["서울특별시", "서울"])
-        ].copy()
-        add_log(
-            power_logs, "전력", "서울 선택",
-            before, len(work),
-        )
-
-        before = len(work)
-        work = work[
-            work["업종별"].map(normalize).isin(["합계", "계", "총계"])
-        ].copy()
-        add_log(
-            power_logs, "전력", "업종 합계 행 선택",
-            before, len(work), "세부 업종과 합계의 이중 집계 방지",
-        )
-    else:
-        region_col = "자치구명"
-        default_unit = "MWh"
-
-        if region_col not in work.columns:
-            raise ValueError("자치구명 컬럼이 없습니다.")
-
-        if "연도" in work.columns:
-            before = len(work)
-            work = work[to_number(work["연도"]).eq(2025)].copy()
-            add_log(
-                power_logs, "전력", "2025년 선택",
-                before, len(work),
-            )
-
-    missing_columns = [m for m in MONTHS if m not in work.columns]
-    if missing_columns:
-        raise ValueError(
-            "월별 컬럼이 없습니다: " + ", ".join(missing_columns)
-        )
-
+    power_data = prepare_power(power_raw)
+    saved_power_units = st.session_state.setdefault("saved_power_units", {})
+    power_identity = str(power_path.resolve())
+    remembered_unit = saved_power_units.get(power_identity, power_data["default_unit"])
     power_unit = st.sidebar.selectbox(
-        "전력 원본 단위",
-        ["kWh", "MWh", "GWh"],
-        index=["kWh", "MWh", "GWh"].index(default_unit),
+        "전력 원본 단위", ["kWh", "MWh", "GWh"],
+        index=["kWh", "MWh", "GWh"].index(remembered_unit),
+        key=f"power_unit::{power_path.resolve()}",
     )
-    st.sidebar.caption("단위는 원본 자료 설명에서 확인하세요.")
-
-    work[region_col] = work[region_col].map(normalize)
-
-    before = len(work)
-    work = work[work[region_col].isin(SEOUL_GU)].copy()
-    add_log(
-        power_logs, "전력", "서울 25개 구 선택",
-        before, len(work),
-    )
-
-    if work[region_col].duplicated().any():
-        duplicates = work.loc[
-            work[region_col].duplicated(keep=False), region_col
-        ].unique()
-        raise ValueError(
-            "구별 중복 행이 있습니다. 자동 합산하지 않았습니다: "
-            + ", ".join(duplicates)
-        )
-
-    matrix = work.set_index(region_col)[MONTHS].copy()
-    matrix.index.name = "자치구"
-
-    factor = {"kWh": 0.001, "MWh": 1, "GWh": 1000}[power_unit]
-
-    for month in MONTHS:
-        matrix[month] = to_number(matrix[month]) * factor
-
-    invalid_cells = int(matrix.isna().sum().sum())
-    before = len(matrix)
-    matrix = matrix.dropna(how="any")
-    add_log(
-        power_logs, "전력", "월별 결측·숫자 변환 실패 처리",
-        before, len(matrix),
-        f"결측 셀 {invalid_cells}개. 12개월이 완전한 구만 사용",
-    )
-
-    before = len(matrix)
-    matrix = matrix.loc[~(matrix < 0).any(axis=1)]
-    add_log(
-        power_logs, "전력", "음수가 포함된 구 제외",
-        before, len(matrix), "원본 확인 필요",
-    )
-
-    before = len(matrix)
-    matrix = matrix.loc[matrix.sum(axis=1) > 0].sort_index()
-    add_log(
-        power_logs, "전력", "연간 사용량 0 이하 제외",
-        before, len(matrix),
-    )
-
-    if matrix.empty:
-        raise ValueError("전처리 후 남은 전력 데이터가 없습니다.")
-
-    annual = matrix.sum(axis=1)
-    shares = matrix.div(annual, axis=0) * 100
-
-    lo, hi = iqr_limits(annual)
-    outliers = annual[(annual < lo) | (annual > hi)].index.tolist()
-
-    add_log(
-        power_logs, "전력", "연간 사용량 이상치 점검",
-        len(matrix), len(matrix),
-        "IQR×1.5 기준. 실제 지역 규모 차이일 수 있어 유지. 후보: "
-        + (", ".join(outliers) if outliers else "없음"),
-    )
-
+    saved_power_units[power_identity] = power_unit
+    st.sidebar.caption("단위는 원본 자료 설명에서 확인하세요. 파일별로 따로 기억합니다.")
+    if power_unit != power_data["unit"]:
+        power_data = prepare_power(power_raw, power_unit)
+    power_original = power_data["original"]
+    matrix = power_data["matrix"]
+    annual = power_data["annual"]
+    shares = power_data["shares"]
+    power_logs = power_data["logs"]
 except Exception as exc:
     st.error(f"전력 전처리 오류: {exc}")
     st.markdown("#### 읽어온 원본 데이터")
     show_table(power_raw)
     st.stop()
+
+# 선택 파일과 비교 파일은 합산하거나 평균내지 않고 각각 전처리한다.
+power_sources = {power_path: power_data}
+source_errors = []
+for other_path in power_files:
+    if other_path == power_path:
+        continue
+    try:
+        other_raw = read_file(other_path.read_bytes(), other_path.suffix.lower())
+        other_unit = saved_power_units.get(str(other_path.resolve()))
+        power_sources[other_path] = prepare_power(other_raw, other_unit)
+    except Exception as exc:
+        source_errors.append(f"{other_path.name}: {exc}")
 
 
 # =========================================================
@@ -449,9 +740,13 @@ else:
             ["kW", "MW", "W"],
         )
 
+        status_options = ["사용 안 함"] + columns
+        status_default = next(
+            (c for c in columns if "가동상태" in c or "운영상태" in c), "사용 안 함"
+        )
         status_col = st.sidebar.selectbox(
             "운영 상태 필터 컬럼 (선택)",
-            ["사용 안 함"] + columns,
+            status_options, index=status_options.index(status_default),
         )
 
         solar_work = solar_original.copy()
@@ -465,11 +760,16 @@ else:
             states = sorted(
                 solar_work[status_col].dropna().astype(str).unique().tolist()
             )
+            active_states = [
+                value for value in states
+                if normalize(value) in {"가동중", "운영중", "정상가동", "정상운영"}
+            ]
             selected_states = st.sidebar.multiselect(
-                "집계할 상태",
-                states,
-                default=states,
+                "집계할 상태", states, default=active_states or states,
+                key=f"solar_states::{solar_path.resolve()}::{status_col}",
             )
+            if not active_states:
+                st.sidebar.caption("운영 상태의 뜻을 확인하고 집계할 값을 선택하세요.")
             before = len(solar_work)
             solar_work = solar_work[
                 solar_work[status_col].astype(str).isin(selected_states)
@@ -530,6 +830,18 @@ else:
             f"IQR×1.5 후보 {extreme_count}건. 대규모 설비일 수 있어 유지",
         )
 
+        duplicate_count = int(solar_work.duplicated().sum())
+        add_log(
+            solar_logs, "태양광", "완전 동일 행 점검",
+            len(solar_work), len(solar_work),
+            f"완전 동일 행 {duplicate_count}건. 자동 삭제하지 않음; "
+            "주소가 같아도 별도 시설·설치 단계일 수 있음",
+        )
+        if duplicate_count:
+            st.warning(
+                f"태양광에 완전 동일 행 {duplicate_count}건이 있습니다. "
+                "중복 여부를 원본에서 확인하세요."
+            )
         solar_clean = solar_work
         solar_agg = (
             solar_clean.groupby("자치구", as_index=False)
@@ -544,91 +856,108 @@ else:
 
 
 # =========================================================
-# 6. 분석 테이블
+# 6. 분석 테이블 및 공개된 추천 기준
 # =========================================================
 demand_df = (
-    annual.rename("연간소비량_MWh")
-    .rename_axis("자치구")
-    .reset_index()
-    .sort_values("연간소비량_MWh", ascending=False)
-    .reset_index(drop=True)
+    annual.rename("연간소비량_MWh").rename_axis("자치구").reset_index()
+    .sort_values("연간소비량_MWh", ascending=False).reset_index(drop=True)
 )
-
 combined = None
+priority_df = None
+priority_meta = None
+candidates = pd.DataFrame()
+priority_mode = PRIORITY_MODES[0]
+recommend_n = 5
 
 if solar_error is None and solar_agg is not None:
-    combined = demand_df.merge(
-        solar_agg, on="자치구", how="left", validate="one_to_one"
-    )
-
-    combined["자료내등록없음"] = combined["설비용량_kW"].isna()
-
-    # '실제 설비 없음'이 아니라 '이 자료에서 집계된 설비 없음'
-    combined[["설비건수", "설비용량_kW"]] = (
-        combined[["설비건수", "설비용량_kW"]].fillna(0)
-    )
-    combined["설비건수"] = combined["설비건수"].astype(int)
-
-    combined["수요대비설비_kW_GWh"] = (
-        combined["설비용량_kW"]
-        / (combined["연간소비량_MWh"] / 1000)
-    )
+    combined = combine_demand_solar(annual, solar_agg)
+    summer = shares[["6월", "7월", "8월"]].sum(axis=1)
+    combined["여름사용비중_pct"] = combined["자치구"].map(summer)
+    sector_features = power_data["sector_features"]
+    if len(sector_features.columns):
+        combined = combined.merge(
+            sector_features.reset_index(), on="자치구", how="left", validate="one_to_one"
+        )
+    known_count = int((~combined["자료내등록없음"]).sum())
+    if known_count:
+        st.sidebar.header("📍 추가 설치 검토 기준")
+        priority_mode = st.sidebar.selectbox("후보 선정 기준", PRIORITY_MODES)
+        if priority_mode != PRIORITY_MODES[0]:
+            recommend_n = int(st.sidebar.number_input(
+                "최대 후보 구 수", min_value=1, max_value=known_count,
+                value=min(5, known_count), step=1,
+            ))
+        st.sidebar.caption(
+            "후보 선정은 설비용량 기준입니다. 군집 모델·산점도 축을 바꿔도 "
+            "추천 조건은 바뀌지 않습니다."
+        )
+        priority_df, priority_meta = build_priority(combined, priority_mode, recommend_n)
+        candidates = priority_df[priority_df["선정"]].copy()
 
 
 # =========================================================
-# 7. 군집 계산: PCA 없음
+# 7. 군집 계산: 기존 KMeans 유지, Ward·GMM 비교 / PCA 없음
 # =========================================================
 cluster_result = None
 cluster_error = None
+cluster_metrics = None
+cluster_results = {}
+cluster_excluded = []
+selected_model = None
+feature_cols = ["연간소비량_MWh", "설비용량_kW"]
 k = None
+cluster_y = "설비용량_kW"
 
 if combined is not None:
     st.sidebar.header("🧩 군집 설정")
-
     cluster_y = st.sidebar.selectbox(
-        "군집 산점도 y축",
+        "군집 산점도 y축 (표시만 변경)",
         ["설비용량_kW", "설비건수"],
         format_func=lambda x: {
             "설비용량_kW": "태양광 설비용량 (kW)",
             "설비건수": "태양광 사업 건수 (건)",
         }[x],
     )
-
     st.sidebar.caption(
-        "건수는 CSV의 유효 행 수 기준입니다. "
-        "한 행이 한 발전소인지 원본 자료 설명을 확인하세요."
+        "군집 기본 입력은 전력량과 설비용량입니다. 건수는 CSV의 유효 행 수이며 "
+        "발전소 수와 다를 수 있습니다."
     )
+    if st.sidebar.checkbox("군집에 여름(6~8월) 전력 비중 추가", value=False):
+        feature_cols.append("여름사용비중_pct")
+    sector_options = ["사용 안 함"] + [
+        col for col in ["가정용비중_pct", "서비스업비중_pct"]
+        if col in combined.columns and combined[col].notna().any()
+    ]
+    if len(sector_options) > 1:
+        sector_choice = st.sidebar.selectbox(
+            "군집에 업종 비중 1개 추가", sector_options,
+            format_func=lambda x: FEATURE_LABELS.get(x, x),
+            key=f"sector_feature::{power_path.resolve()}",
+        )
+        if sector_choice != "사용 안 함":
+            feature_cols.append(sector_choice)
+    else:
+        st.sidebar.caption("현재 전력 파일에는 사용할 업종별 비중이 없습니다.")
 
     try:
-        inputs = np.column_stack([
-            np.log1p(combined["연간소비량_MWh"].to_numpy(dtype=float)),
-            np.log1p(combined[cluster_y].to_numpy(dtype=float)),
-        ])
-
-        unique_count = len(np.unique(inputs, axis=0))
-        max_k = min(6, len(combined) - 1, unique_count)
-
+        cluster_frame = combined.loc[~combined["자료내등록없음"]].copy()
+        cluster_frame = cluster_frame.replace([np.inf, -np.inf], np.nan)
+        cluster_frame = cluster_frame.dropna(subset=feature_cols)
+        cluster_excluded = sorted(set(combined["자치구"]) - set(cluster_frame["자치구"]))
+        unique_count = len(np.unique(cluster_frame[feature_cols].to_numpy(dtype=float), axis=0))
+        max_k = min(6, len(cluster_frame) - 1, unique_count)
         if max_k < 2:
             raise ValueError("군집 분석에 필요한 서로 다른 구별 값이 부족합니다.")
-
         k = int(st.sidebar.selectbox(
-            "군집 수",
-            list(range(2, max_k + 1)),
-            index=1 if max_k >= 3 else 0,
+            "군집 수", list(range(2, max_k + 1)), index=1 if max_k >= 3 else 0,
         ))
-
-        scaled = StandardScaler().fit_transform(inputs)
-        model = KMeans(
-            n_clusters=k,
-            random_state=42,
-            n_init=20,
+        if k > 3:
+            st.sidebar.caption("25개 구처럼 작은 표본은 2~3개 군집부터 비교하는 것이 좋습니다.")
+        cluster_results, cluster_metrics = fit_cluster_models(
+            cluster_frame, feature_cols, ["연간소비량_MWh", "설비용량_kW"], k
         )
-
-        cluster_result = combined.copy()
-        cluster_result["군집"] = (
-            model.fit_predict(scaled) + 1
-        ).astype(str)
-
+        selected_model = st.sidebar.selectbox("표시할 군집 모델", list(cluster_results))
+        cluster_result = cluster_results[selected_model]
     except Exception as exc:
         cluster_error = str(exc)
 
@@ -655,8 +984,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📋 원본·전처리",
     "📊 연간 사용량",
     "🔥 월별 히트맵",
-    "🧩 군집 산점도",
-    "📝 결과·한계",
+    "🧩 군집 비교·산점도",
+    "📝 추천·자료 비교",
 ])
 
 
@@ -726,6 +1055,9 @@ with tab1:
         key="download_logs",
     )
 
+    if power_data["sector_notes"]:
+        for note in power_data["sector_notes"]:
+            st.warning(note)
     st.markdown("#### 전처리 후 전력 사용량 (MWh)")
     st.dataframe(matrix, use_container_width=True)
 
@@ -733,8 +1065,8 @@ with tab1:
         st.markdown("#### 구별 전력·태양광 결합 데이터")
         show_table(combined, hide_index=True)
         st.caption(
-            "자료내등록없음=True인 구의 0은 실제 설비가 없다는 뜻이 아니라 "
-            "선택한 자료·필터에서 유효한 설비가 집계되지 않았다는 뜻입니다."
+            "자료내등록없음=True인 구는 설비용량을 빈값으로 유지합니다. "
+            "실제 0으로 바꾸지 않고 군집과 후보 선정에서 제외합니다."
         )
 
 
@@ -908,11 +1240,31 @@ with tab4:
                 else "태양광 사업 건수 (건)"
             )
 
+            st.markdown("#### 같은 입력으로 비교한 세 모델")
+            st.dataframe(cluster_metrics.round(4), hide_index=True, use_container_width=True)
             st.caption(
-                f"군집 입력: 연간 전력 사용량과 {y_title}. "
-                f"두 변수를 log1p 변환·표준화한 뒤 KMeans(k={k})를 적용했습니다. "
-                "PCA는 사용하지 않습니다."
+                "실루엣 점수는 군집 분리도입니다. BIC는 같은 자료·입력 특성에서 GMM 설정끼리 비교하는 지표이며 "
+                "다른 모델의 실루엣 점수와 직접 비교하지 않습니다. 설치 예측 정확도가 아닙니다."
             )
+            if (cluster_metrics["최소 군집 구 수"].dropna() < 3).any():
+                st.info("3개 구 미만의 작은 군집이 있습니다. 군집 수·입력 변경에 민감할 수 있습니다.")
+            if cluster_excluded:
+                st.warning("설비 또는 선택 특성 미확인으로 군집에서 제외: " + ", ".join(cluster_excluded))
+            st.caption(
+                f"표시 모델: {selected_model}, 군집 수: {k}. 입력: "
+                + ", ".join(FEATURE_LABELS[c] for c in feature_cols)
+                + ". 전력량·설비용량만 log1p 변환하고 모든 입력을 표준화합니다. PCA는 사용하지 않습니다."
+            )
+            if len(feature_cols) > 2:
+                st.caption("점의 색은 추가 특성까지 반영한 결과입니다. 화면의 두 축만으로 만든 군집이 아닙니다.")
+            if selected_model == "GMM":
+                st.caption("군집소속확률은 선택한 GMM 안에서의 소속 정도이며 설치 성공확률이 아닙니다.")
+            hover_fields = {
+                "연간소비량_MWh": ":,.0f", "설비용량_kW": ":,.2f",
+                "설비건수": True, "자료내등록없음": True,
+            }
+            if "군집소속확률" in cluster_result.columns:
+                hover_fields["군집소속확률"] = ":.1%"
 
             # 원래 단위를 그대로 표시해 0도 정확히 표현
             fig = px.scatter(
@@ -922,13 +1274,8 @@ with tab4:
                 color="군집",
                 text="자치구",
                 hover_name="자치구",
-                hover_data={
-                    "연간소비량_MWh": ":,.0f",
-                    "설비용량_kW": ":,.2f",
-                    "설비건수": True,
-                    "자료내등록없음": True,
-                },
-                title=f"서울 자치구별 전력 사용량 × {y_title}",
+                hover_data=hover_fields,
+                title=f"{selected_model}: 서울 자치구별 전력 사용량 × {y_title}",
                 labels={
                     "연간소비량_MWh": "연간 전력 사용량 (MWh)",
                     "설비용량_kW": "태양광 설비용량 (kW)",
@@ -964,7 +1311,8 @@ with tab4:
             st.caption(
                 f"점선은 분석 대상 {len(cluster_result)}개 구의 중앙값입니다. "
                 "축은 원래 단위이고, 군집 계산에만 log1p·표준화를 사용했습니다. "
-                "군집 번호는 순위가 아닙니다."
+                "군집 번호는 평균 전력 수요 순으로 정렬한 표시이며 설치 순위가 아닙니다. "
+                "모델이 다르면 같은 번호라도 구성원이 다를 수 있습니다. 건수 축은 표시용으로만 사용합니다."
             )
 
             profile = (
@@ -996,38 +1344,14 @@ with tab4:
                     + ", ".join(group["자치구"].tolist())
                 )
 
-            candidates = cluster_result[
-                (cluster_result["연간소비량_MWh"] > demand_median)
-                & (cluster_result[cluster_y] < solar_median)
-            ]
-
-            if not candidates.empty:
-                finding(
-                    "수요는 중앙값보다 크고 태양광 지표는 중앙값보다 작은 구는 "
-                    + ", ".join(candidates["자치구"].tolist())
-                    + "입니다.",
-                    f"전력 사용량 중앙값 {demand_median:,.0f} MWh, "
-                    f"{y_title} 중앙값 {solar_median:,.2f}, "
-                    f"해당 구 {len(candidates)}개",
-                )
-            else:
-                finding(
-                    "수요가 중앙값보다 크면서 태양광 지표가 "
-                    "중앙값보다 작은 구는 없습니다.",
-                    f"전력 사용량 중앙값 {demand_median:,.0f} MWh, "
-                    f"{y_title} 중앙값 {solar_median:,.2f}",
-                )
-
-            st.warning(
-                "오른쪽 아래 지역은 추가 조사 후보입니다. "
-                "설치 가능 면적·일사량·계통 여건을 반영한 최적 입지는 아닙니다. "
-                "자료에 등록이 없는 경우도 실제 설비 부재와 구분해야 합니다."
+            st.info(
+                "군집은 비슷한 구를 묶는 분석입니다. 추가 설치 검토 후보는 "
+                "추천·자료 비교 탭에서 별도의 공개된 기준으로 선정합니다."
             )
-
             st.download_button(
                 "구별 군집 결과 다운로드",
                 csv_bytes(cluster_result),
-                "seoul_cluster_result.csv",
+                f"seoul_{dict(KMeans='kmeans', GMM='gmm').get(selected_model, 'ward')}_cluster_result.csv",
                 "text/csv",
                 key="download_clusters",
             )
@@ -1037,63 +1361,158 @@ with tab4:
 
 
 # =========================================================
-# 13. 결과·한계
+# 13. 추천 기준·전력 자료 비교·한계
 # =========================================================
 with tab5:
-    st.subheader("질문 4. 수요 대비 태양광 설비가 적게 집계된 구는?")
-
-    if combined is not None:
-        comparison = combined.sort_values(
-            ["수요대비설비_kW_GWh", "연간소비량_MWh"],
-            ascending=[True, False],
-        ).reset_index(drop=True)
-
+    st.subheader("질문 4. 어느 구를 태양광 추가 설치 검토 후보로 볼 것인가?")
+    if priority_df is not None and not priority_df.empty:
+        st.write(f"**선택한 기준:** {priority_mode}")
         st.caption(
-            "수요 대비 설비 = 설비용량(kW) ÷ 연간 소비량(GWh). "
-            "값이 작을수록 이 자료에 집계된 태양광 설비가 수요 대비 적습니다. "
-            "군집 결과와는 별개의 기술통계 지표입니다."
+            f"선정 조건: {priority_meta['rule']}. 중앙값은 전력·태양광 정보가 "
+            f"모두 확인된 {priority_meta['n']}개 구 기준입니다. "
+            "비율 동률은 전력 수요가 큰 순, 그다음 자치구 이름순으로 표시합니다."
         )
-
-        st.dataframe(
-            comparison.round(3),
-            hide_index=True,
-            use_container_width=True,
+        a, b, c = st.columns(3)
+        a.metric("조건에 해당하는 후보", f"{len(candidates)}개 구")
+        b.metric("수요 중앙값", f"{priority_meta['demand_median']:,.2f} MWh")
+        c.metric("설비용량 중앙값", f"{priority_meta['solar_median']:,.3f} kW")
+        if priority_meta["zero_median"] and priority_mode == PRIORITY_MODES[0]:
+            st.info(
+                "확인된 설비용량의 중앙값이 0이므로 기존 조건의 용량 기준을 "
+                "'용량=0'으로 적용했습니다. 미등록 구는 여전히 제외합니다."
+            )
+        result_cols = [
+            "자치구", "연간소비량_MWh", "설비용량_kW", "설비건수",
+            "수요대비설비_kW_GWh", "수요중앙값차이_MWh", "용량중앙값차이_kW",
+        ]
+        if not candidates.empty:
+            finding(
+                "추가 조사 후보: " + ", ".join(candidates["자치구"]),
+                priority_meta["rule"],
+            )
+            st.dataframe(candidates[result_cols].round(3), hide_index=True, use_container_width=True)
+        else:
+            st.info("선택한 조건을 만족하는 구가 없습니다. 이것이 설치 가능한 곳이 없다는 뜻은 아닙니다.")
+        st.caption(
+            "수요 대비 설비 = 설비용량(kW) / 연간 사용량(GWh). 작을수록 제공 자료에서 "
+            "수요 대비 설비가 적게 집계됩니다."
         )
-
+        if priority_mode == PRIORITY_MODES[0] and not priority_meta["zero_median"]:
+            st.caption("기존 조건은 엄격한 <, > 비교이므로 중앙값과 같은 구는 해당 조건에서 제외됩니다.")
+        with st.expander("전체 구의 비교값과 후보 선정 여부"):
+            st.dataframe(
+                priority_df[["비율순서"] + result_cols + ["선정", "선정근거"]].round(3),
+                hide_index=True, use_container_width=True,
+            )
+        unknown_gu = combined.loc[combined["자료내등록없음"], "자치구"].tolist()
+        if unknown_gu:
+            st.warning("태양광 현황 미확인으로 추천에서 제외: " + ", ".join(unknown_gu))
+        export_priority = priority_df.assign(
+            전력자료=power_path.name, 전력원본단위=power_unit,
+            태양광자료=solar_path.name, 추천기준=priority_mode,
+        )
+        st.download_button(
+            "후보 선정 근거 다운로드", csv_bytes(export_priority),
+            "seoul_solar_priority.csv", "text/csv", key="download_priority",
+        )
         st.info(
-            "위 표의 순서는 설치 적합성 순위가 아닙니다. "
-            "누락 여부와 운영 상태를 먼저 확인한 뒤 추가 조사에 활용하세요."
+            "이 결과는 제공 자료와 선택한 기준에 따른 추가 조사 우선순위입니다. "
+            "실제 발전량·설치 가능 면적·비용을 평가한 최적 입지나 설치 성공확률은 아닙니다."
         )
+    elif combined is not None:
+        st.info("전력·태양광 정보가 함께 확인된 구가 없어 후보를 계산하지 않았습니다.")
+    else:
+        st.info("태양광 파일을 설정하면 구별 추가 조사 후보를 확인할 수 있습니다.")
+
+    st.divider()
+    st.subheader("전력 파일을 바꿔도 결과가 유지되는가?")
+    source_rows = []
+    source_candidate_sets = []
+    for source_path, data in sorted(power_sources.items(), key=lambda item: item[0].name):
+        common = annual.index.intersection(data["annual"].index)
+        base_sum = float(annual.reindex(common).sum())
+        compared_sum = float(data["annual"].reindex(common).sum())
+        difference = compared_sum - base_sum if len(common) else np.nan
+        row = {
+            "전력파일": source_path.name, "현재선택": source_path == power_path,
+            "원본단위": data["unit"], "분석구수": len(data["annual"]),
+            "연간합계_MWh": float(data["annual"].sum()),
+            "공통비교구수": len(common),
+            "선택자료대비차이_MWh": difference,
+            "선택자료대비차이_pct": difference / base_sum * 100 if base_sum > 0 else np.nan,
+        }
+        if solar_agg is not None and solar_error is None:
+            other_combined = combine_demand_solar(data["annual"], solar_agg)
+            other_priority, _ = build_priority(other_combined, priority_mode, recommend_n)
+            selected_gu = other_priority.loc[other_priority["선정"], "자치구"].tolist()
+            row["선택기준후보"] = ", ".join(selected_gu) or "없음"
+            source_candidate_sets.append(set(selected_gu))
+        source_rows.append(row)
+    source_comparison = pd.DataFrame(source_rows)
+    st.dataframe(source_comparison.round(3), hide_index=True, use_container_width=True)
+    st.caption(
+        "각 파일을 독립적으로 집계하며 서로 합산·평균하지 않습니다. 비교 차이는 공통 구만 "
+        "사용하며 현재 선택한 전력 파일이 기준입니다. 단위는 파일별 선택값을 사용하고, "
+        "아직 선택하지 않은 파일은 형식별 기본 단위를 사용합니다."
+    )
+    if len(power_sources) > 1:
+        st.info(
+            "전력 파일 간 차이는 집계 대상·작성 기준 차이일 수 있습니다. "
+            "파일 내용만으로 어느 자료가 더 정확한지는 단정하지 않습니다."
+        )
+        with st.expander("전력 파일별 구별 연간 사용량 비교 (MWh)"):
+            source_detail = pd.concat(
+                {path.name: data["annual"] for path, data in
+                 sorted(power_sources.items(), key=lambda item: item[0].name)}, axis=1
+            )
+            source_detail.index.name = "자치구"
+            st.dataframe(source_detail.round(3), use_container_width=True)
+        if len(source_candidate_sets) >= 2:
+            common_candidates = sorted(set.intersection(*source_candidate_sets))
+            st.write(
+                f"**정상 처리된 {len(source_candidate_sets)}개 전력 파일의 공통 후보:** "
+                + (", ".join(common_candidates) if common_candidates else "없음")
+            )
+            st.caption("같은 추천 기준·태양광 자료를 적용한 결과이며, 공통 후보도 설치 적합성이 검증된 것은 아닙니다.")
+    else:
+        st.caption("전력 파일이 두 개 이상 있으면 출처별 수요와 후보를 비교할 수 있습니다.")
+    for error in source_errors:
+        st.warning("비교에서 제외한 전력 파일: " + error)
+    st.download_button(
+        "전력 자료 비교 다운로드", csv_bytes(source_comparison),
+        "seoul_power_source_comparison.csv", "text/csv", key="download_sources",
+    )
 
     st.markdown("""
 ### 분석 방법
-- 전력 사용량은 2025년 1~12월을 합산하고 MWh로 통일합니다.
-- 12개월 중 결측값이 있는 구는 연간 비교에서 제외합니다.
-- 태양광 자료는 주소·자치구와 유효한 설비용량으로 구별 집계합니다.
-- 통계적 이상치는 실제 대규모 수요·설비일 수 있어 삭제하지 않습니다.
-- 군집은 전력 사용량과 선택한 태양광 지표 두 개로 만듭니다.
-- 군집 수는 사이드바에서 사용자가 지정합니다.
+- 전력은 2025년 1~12월을 합산하고 MWh로 통일합니다.
+- 월별 값이 불완전한 구는 연간 비교에서 제외하고 처리 로그를 남깁니다.
+- 태양광은 선택한 파일·운영 상태의 유효 기록을 구별로 합산합니다.
+- 자료기준일·설치연도를 이유로 태양광 기록을 자동 제외하지 않습니다.
+- 태양광 미등록 구의 값은 빈값으로 유지하고 군집·추천에서 제외합니다.
+- 큰 수요·대형 설비는 실제 특성일 수 있어 IQR 이상치라는 이유로 삭제하지 않습니다.
+- 군집은 같은 입력·전처리로 KMeans, Ward, GMM을 비교합니다. PCA는 사용하지 않습니다.
+- 기본 입력은 전력량·설비용량이며 계절·업종 비중은 선택적으로 추가합니다.
+- 업종 비중은 선택한 전력 파일에서만 계산하며 '-'를 임의로 0으로 바꾸지 않습니다.
+- 추천은 군집과 별개의 공개 조건입니다. 산점도 축·군집 모델을 바꿔도 추천 기준은 유지됩니다.
 
 ### 해석의 한계
-- 이것은 미래 예측이 아니라 **탐색적 군집 분석**입니다.
-- 서울 25개 구라는 작은 표본이므로 군집을 확정적인 유형으로 보지 않습니다.
-- 태양광 자료의 기준 시점이 2025년과 다르면 서로 다른 시점을 비교하게 됩니다.
-- 발전사업 정보에는 허가·계획 단계가 포함될 수 있습니다.
-  실제 운영 설비 분석에는 운영 상태와 준공 시점 확인이 필요합니다.
-- 한 행이 한 발전소인지 확인하기 전에는 행 수를 발전소 수로 단정하지 않습니다.
-- 집계되지 않은 구의 0은 실제 설비가 없다는 의미가 아닙니다.
-- 태양광 설비용량은 발전량이 아닙니다.
-  이 앱은 발전량이나 실제 전력 자급률을 계산하지 않습니다.
-- 전력은 광역 계통으로 공급되므로 구별 태양광 설비가 적다고
-  해당 구에 전력 공급 부족이 발생한다는 의미는 아닙니다.
-- 최종 입지 선정에는 설치 가능 면적, 일사량, 건물 구조,
-  계통 접속, 비용 등의 추가 자료가 필요합니다.
+- 최종 분석 단위는 서울 25개 구입니다. 시설 557건이나 월별 300셀이
+  독립적인 설치 적합성 정답 557개·300개가 되는 것은 아닙니다.
+- 세 모델은 지역 유형을 나누는 비지도 군집 모델입니다.
+  실루엣·BIC·군집소속확률은 설치 성공률이나 발전량 예측 정확도가 아닙니다.
+- 제공된 태양광 목록의 범위 밖에 있는 설비까지 조사한 결과는 아닙니다.
+- 설비 건수는 유효 행 수이며 한 행이 한 발전소인지는 자료 정의를 확인해야 합니다.
+- 설비용량(kW)은 발전량(kWh)이 아닙니다. 수요 대비 설비 지표는 전력 자급률이 아닙니다.
+- 월별 사용량은 낮 시간 수요나 순간 최대전력을 직접 나타내지 않습니다.
+- 구별 설비가 적다고 그 구에 전력 공급 부족이 발생한다는 의미는 아닙니다.
+- 실제 건물·옥상 선정에는 설치 가능 면적, 일사량·그늘, 건물 구조, 계통 접속, 비용 등이 필요합니다.
 """)
-
     st.download_button(
         "전처리된 월별 전력 데이터 다운로드",
-        csv_bytes(matrix.reset_index()),
-        "seoul_2025_monthly_MWh.csv",
-        "text/csv",
-        key="download_monthly",
+        csv_bytes(matrix.reset_index()), "seoul_2025_monthly_MWh.csv",
+        "text/csv", key="download_monthly",
     )
+
+
+
